@@ -25,16 +25,16 @@
 # that you don't want users to be able to adjust.
 
                      ME="initrd init"
-                VERSION="7.20.04"
-           VERSION_DATE="Thu Jun 18 19:39:52 MDT 2015"
+                VERSION="7.22.00"
+           VERSION_DATE="Wed Dec 16 13:19:19 MST 2015"
               DEVELOPER="BitJam"
-  DISTRO_BUG_REPORT_URL="http://antix.freeforums.org"
+         BUG_REPORT_URL="liveboot@mxlinux.org"
 
         RETRY_TIME=10
      PERSIST_RETRY=10
 
            RW_MODE="ro"
-       DISTRO_NAME="Linux"
+       #DISTRO_NAME="Linux"
             PRINTK=0
 
           LIVE_DIR="/live"
@@ -67,10 +67,11 @@
 
         DO_HOTPLUG=true
        DO_COLDPLUG=true
+    COLDPLUG_DELAY=4
 
         # Note: adding "crc32c-generic" works around a bug in the kernel:
         # https://github.com/manjaro/packages-core/issues/8
-        LOAD_FIRST="usb-common usbcore ehci-hcd fusbh200-hcd fotg210-hcd battery aufs crc32c-generic"
+        LOAD_FIRST="usb-common usbcore ehci-hcd fusbh200-hcd fotg210-hcd battery aufs overlay crc32c-generic"
 
           VID_NAME=VID
       LINUXFS_NAME=linuxfs
@@ -98,6 +99,8 @@ MKFS_FREE_MARGIN=20
    GFX_SAVE_SCRIPT="/bin/gfxsave"
 
           NO_PLINK=",noplink"
+
+   DEFAULT_UNIONFS="aufs"
 
 set_live_dirs() {
     local dir=$1
@@ -150,6 +153,10 @@ main_wrapper() {
     make_nodes /dev
 
     read_distro_release /etc/initrd-release
+    : ${DISTRO_BUG_REPORT_URL:=$BUG_REPORT_URL}
+    : ${DISTRO_NAME:=MX}
+    : ${DISTRO_PRETTY_NAME:=MX-15 (Fusion)}
+
     custom_code 0 'before reading boot codes'
 
     read_cmdline_params
@@ -263,7 +270,15 @@ main_core() {
     breakpoint 1 "before welcome"
 
     # These ones must be loaded before the others
-    echo $LOAD_FIRST | xargs modprobe -q -a 2>/dev/null
+    # Add a cheap black-lister
+    if [ ${#BLACK_LIST} -gt 0 ]; then
+        local bl_regex=${BLACK_LIST#,}
+        bl_regex=${bl_regex%,}
+        bl_regex=${bl_regex//,/|}
+        echo $LOAD_FIRST | tr " " "\n" | egrep -v "^($bl_regex)$" | xargs modprobe -q -a 2>/dev/null
+    else
+        echo $LOAD_FIRST | xargs modprobe -q -a 2>/dev/null
+    fi
 
     [ "$DO_HOTPLUG" ] && start_hotplug  $TRACE_LOAD
 
@@ -273,13 +288,18 @@ main_core() {
 
     breakpoint 2 "before coldplug"
 
+    check_unionfs
+
     local orig_fb_name=$(cat /sys/class/graphics/fb0/name 2> /dev/null)
     load_kernel_modules "$MODULE_LIST"
     set_fbcondecor "$SPLASH_PARAM" "$orig_fb_name"
 
     touch /live/config/cmdline
 
-    [ "$DO_MENUS" ] && do_menus
+    if [ "$DO_MENUS" ]; then
+        coldplug_delay
+        do_menus
+    fi
 
     clean_xlat
 
@@ -380,7 +400,7 @@ main_core() {
 
     [ "$STATIC_ROOT" ] && log_cmd umount $AUFS_RAM_MP
 
-    mount_aufs "$AUFS_MP" "$SQFS_MP" "$AUFS_RAM_MP" "$ROOTFS_MP"
+    mount_unionfs "$AUFS_MP" "$SQFS_MP" "$AUFS_RAM_MP" "$ROOTFS_MP"
 
     SYSTEM_D=
     local sbin_init=$(readlink $NEW_ROOT/sbin/init)
@@ -497,8 +517,11 @@ read_cmdline_params()
         value=${param#*=}
 
         case $param in
+                           aufs) WANT_UNIONFS=aufs                               ;;
+                      overlayfs) WANT_UNIONFS=overlay                            ;;
                           menus) DO_MENUS=${MENUS_LIST:-ltopd}                   ;;
                         menus=*) DO_MENUS=$DO_MENUS$value                        ;;
+                        delay=*) valid_int COLDPLUG_DELAY $param                 ;;
                 hwclock=*|hwc=*) DO_HWCLOCK=true                                 ;;
                        old-conf) NO_NEW_OUTPUT=true                              ;;
                        new-conf) NO_OLD_OUTPUT=true                              ;;
@@ -770,19 +793,36 @@ valid_int() {
     INTEGER_ERRORS="$INTEGER_ERRORS $param"
 }
 
+coldplug_delay() {
+    [ "$HOTPLUG_DISABLED" ] || return
+    msg "Waiting %s seconds for buses to settle ..."  $COLDPLUG_DELAY
+    sleep $COLDPLUG_DELAY
+    coldplug_modules
+}
+
 start_hotplug() {
-    local trace_load=$1
+    local trace_load=$1  targ=/proc/sys/kernel/hotplug
 
     # Set up file for recording sequence of kernel events sent to mdev
     echo > /dev/mdev.seq
+
+    if true; then
+    #if ! test -e $targ; then
+        msg "Hotplugging was disabled in the kernel"
+        HOTPLUG_DISABLED=true
+        return
+    fi
     if [ "$trace_load" ]; then
-        echo $LIVE_BIN/mdev-trace > /proc/sys/kernel/hotplug
+        echo $LIVE_BIN/mdev-trace   | tee $targ &>/dev/null
     else
-        echo $LIVE_BIN/mdev-hotplug > /proc/sys/kernel/hotplug
+        echo $LIVE_BIN/mdev-hotplug | tee $targ &>/dev/null
     fi
 }
 
-stop_hotplug() { echo > /proc/sys/kernel/hotplug; }
+stop_hotplug() {
+    local targ=/proc/sys/kernel/hotplug
+    test -e $targ && echo | tee $targ &>/dev/null
+}
 
 list_modules() {
     local mod list cnt=0
@@ -1779,25 +1819,82 @@ mount_aufs_ram() {
     mount_tmpfs $aufs_ram_mp $AUFS_RAM_SIZE 'aufs ram' || fatal "Create %s failed" 'aufs tmpfs'
 }
 
-mount_aufs() {
-    local  aufs_arg  aufs_mp=$1  sqfs_mp=$2  aufs_ram_mp=$3  rootfs_mp=$4
+check_unionfs() {
+    test -d /sys/module/aufs    && AUFS_OKAY=true
+    test -d /sys/module/overlay && OVERLAY_OKAY=true
+    [ "$AUFS_OKAY" ]    && vmsg 6 "Found %s" aufs
+    [ "$OVERLAY_OKAY" ] && vmsg 6 "Found %s" overlay
 
-    mkdir -p $aufs_mp
+    case $AUFS_OKAY:$OVERLAY_OKAY in
+            :) fatal "Neither %s nor %s is available" aufs overlayfs ;;
+    esac
+
+    case $WANT_UNIONFS in
+           aufs) want_unionfs "$AUFS_OKAY"     aufs    overlay ;;
+        overlay) want_unionfs "$OVERLAY_OKAY"  overlay aufs    ;;
+    esac
+
+    [ "$USE_UNIONFS" ] && return
+
+    case  $AUFS_OKAY:$OVERLAY_OKAY in
+        true:) USE_UNIONFS=aufs              ;;
+        :true) USE_UNIONFS=overlay           ;;
+    true:true) USE_UNIONFS=$DEFAULT_UNIONFS  ;;
+    esac
+}
+
+want_unionfs() {
+    local okay=$1  this=$2  other=$3
+    if [ "$okay" ]; then
+        USE_UNIONFS=$this
+    else
+        USE_UNIONFS=$other
+        non_fatal "The %s filesystem is not available.  Using %s" "$this" "$other"
+    fi
+}
+
+need_unionfs() {
+    local okay=$1  this=$2
+    if [ "$okay" ]; then
+        [ "$USE_UNIONFS" != "$this" ] && warn "Forcing use of %s to match existing rootfs file" $(pqw $this)
+        USE_UNIONFS=$this
+    else
+        fatal "The %s filesystem is not available. Can't use this %s file" "$this" "rootfs"
+    fi
+}
+
+check_existing_unionfs() {
+    local mp=$1  type
+    if test -d $mp/etc; then
+        need_unionfs "$AUFS_OKAY" aufs
+    elif test -d $mp/upper; then
+        need_unionfs "$OVERLAY_OKAY" overlay
+    fi
+
+    case $USE_UNIONFS in
+           aufs) ROOTFS_BASE=$ROOTFS_MP                        ;;
+        overlay) ROOTFS_BASE=$ROOTFS_MP/upper                  ;;
+              *) fatal "Unknown unionfs type: $USE_UNIONFS"    ;;
+    esac
+}
+
+mount_unionfs() {
+    local upper_mp aufs_mp=$1  aufs_ram_mp=$3  rootfs_mp=$4
 
     if [ -n "$PERSIST_ROOT" -a -n "$STATIC_ROOT" ]; then
         #. Enable <type> persistence
         msg "Enable %s persistence" "$(pq static rootfs)"
-        aufs_arg="$rootfs_mp:$sqfs_mp=ro$NO_PLINK"
+        upper_mp=$rootfs_mp
     else
         STATIC_ROOT=
-        aufs_arg="$aufs_ram_mp:$sqfs_mp=ro$NO_PLINK"
+        upper_mp=$aufs_ram_mp
     fi
 
-    # Do the actual aufs mount
-    vmsg 6 "Mount %s at %s" 'aufs' "$(fq $aufs_mp)"
-
-    log_cmd mount -t aufs -o "br:$aufs_arg",noatime $aufs_mp $aufs_mp \
-        || fatal "Could not mount %s" aufs
+    case $USE_UNIONFS in
+        overlay) mount_overlayfs "$1" "$2" $upper_mp  ;;
+           aufs) mount_aufs      "$1" "$2" $upper_mp  ;;
+              *) fatal "Unknown unionfs type: $USE_UNIONFS"
+    esac
 
     # Grab what we need from /etc before it gets nuked
     cp -a /etc/mtab $aufs_mp/etc/
@@ -1805,6 +1902,33 @@ mount_aufs() {
     # Always a good idea
     mkdir -p   $aufs_mp/tmp $aufs_mp/var/tmp
     chmod 1777 $aufs_mp/tmp $aufs_mp/var/tmp
+}
+
+mount_overlayfs() {
+    local  aufs_mp=$1  sqfs_mp=$2  upper_mp=$3
+
+    local upper=$upper_mp/upper work=$upper_mp/work
+    mkdir -p $aufs_mp $upper $work
+
+    # Do the actual mount
+    vmsg 5 "Mount %s at %s" 'overlayfs' "$(fq $aufs_mp)"
+
+    log_cmd mount -t overlay overlay -o "lowerdir=$sqfs_mp,upperdir=$upper,workdir=$work" $aufs_mp \
+        || fatal "Could not mount %s" overlayfs
+}
+
+
+mount_aufs() {
+    local  aufs_arg  aufs_mp=$1  sqfs_mp=$2  upper_mp=$3
+
+    mkdir -p $aufs_mp
+    local aufs_arg="br:$upper_mp:$sqfs_mp=ro$NO_PLINK"
+
+    # Do the actual aufs mount
+    vmsg 5 "Mount %s at %s" 'aufs' "$(fq $aufs_mp)"
+
+    log_cmd mount -t aufs -o "$aufs_arg",noatime $aufs_mp $aufs_mp \
+        || fatal "Could not mount %s" aufs
 }
 
 link_top_dirs() {
@@ -1827,6 +1951,7 @@ try_mount() {
     [ "$type" ] || return 1
     local opts=$rw,noatime
     local winops=$opts,umask=000,dmask=002,fmask=113
+
     case $type in
         ext[234]) log_cmd mount -t $type -o $opts                    $dev "$mp" 2>/dev/null ;;
             vfat) log_cmd mount -t vfat -o shortname=winnt,$winopts  $dev "$mp" 2>/dev/null ;;
@@ -2465,7 +2590,7 @@ do_menus() {
     local BOOT_MENU_WARN=true
     local lang time_zone option persist desktop
     local cmdline
-    my_select_menu 'Select Language' 'Languages are listed alphabetically'          l lang
+    my_select_menu 'Select Language' 'Languages are listed alphabetically'           l lang
     [ "$lang" ] && read_xlat init ${lang##*=}
     msg "lang: ${lang##*=}"
     my_select_menu "Select Timezone"           "Timezones are listed geographically" t timezone
@@ -2888,7 +3013,7 @@ dir_has_param() {
 #------------------------------------------------------------------------------
 # Function: get_vid <file>
 #------------------------------------------------------------------------------
-get_vid()   { [ -r "$1" ] && grep ^=== $1 | tail -n 1   ;}
+get_vid()   { [ -r "$1" ] && grep ^=== $1 | tail -n 1 ;}
 
 vid_error() {
     VID_ERROR=$(printf "$@")
@@ -2904,10 +3029,13 @@ vid_error() {
 #------------------------------------------------------------------------------
 
 check_vid() {
-    local sqfs_vid=$1  mp=$2  fname=$3  vid_file="$2$VID_DIR/$3.ver"
+    local sqfs_vid=$1  base=$2  fname=$3
+
+    local vid_file=$base$VID_DIR/$fname
     breakpoint v "before check VID"
 
-    local rootfs_vid=$(get_vid $vid_file)
+    local rootfs_vid
+    [ "$vid_file" ] && rootfs_vid=$(get_vid $vid_file)
 
     if [ -n "$sqfs_vid" -a -n "$rootfs_vid" ]; then
 
@@ -2923,12 +3051,16 @@ check_vid() {
 
     elif [ "$sqfs_vid" ]; then
 
+        # This is a hack but it prevents a warning message from the ls command
+        mkdir -p $base
         # Pass test and create new rootfs version file if rootfs is empty
-        if ! ls $mp | egrep -q 'etc|bin|lib|var|usr'; then
+        # This is funky but if we don't do it here then there will be problems
+        # when "toram" is used.
+        if ! ls $base | egrep -q 'etc|bin|lib|var|usr'; then
             msg "Copy %s to empty %s" "$LINUXFS_NAME $VID_NAME" rootfs
 
-            log_cmd mkdir -p "$mp$VID_DIR"      || return 1
-            log_cmd cp $SQFS_VID_FILE $vid_file || return 2
+            log_cmd mkdir -p $(dirname $vid_file)  || return 1
+            log_cmd cp $SQFS_VID_FILE $vid_file    || return 2
             sync
             return 0
 
@@ -3662,12 +3794,14 @@ mount_and_copy_rootfs() {
 
 _mount_and_copy_rootfs() {
     mount_persist_file rootfs "$ROOTFS_MP" root "$WANT_ROOTFS" "$NEED_ROOTFS" || return 1
+    check_existing_unionfs $ROOTFS_MP
     PERSIST_ROOT_FULL="$PERSIST_FULL_PATH/rootfs"
-    check_vid "$SQFS_VID" "$ROOTFS_MP" rootfs                                 || return 1
+    check_vid "$SQFS_VID" "$ROOTFS_BASE" rootfs.ver                           || return 1
     [ "$STATIC_ROOT" ] || copy_persist_to_ram                                 || return 1
 
     return 0
 }
+
 
 #------------------------------------------------------------------------------
 # Function: copy_persist_to_ram
