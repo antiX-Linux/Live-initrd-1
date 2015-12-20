@@ -18,6 +18,9 @@ TZ_FILE=/etc/timezone
 
 MARGIN=$((15 * 60))   # 15 Minutes
 
+. /live/lib/live-init-utils.sh
+start_init_logging
+load_translation
 
 #-jbb For debugging
 : ${CMDLINE:=$(cat /proc/cmdline /live/config/cmdline)}
@@ -35,11 +38,10 @@ umask 022
 
 main() {
     case "$1" in
-        start)
-            do_start ;;
-        *)
-            echo "Usage: $0 {start}"
-            exit 1 ;;
+                start) do_start ;;
+        ask|utc|local) CMD_CLOCK=$1 ;  do_start ;;
+                    *) echo "Usage: $0 {start|ask|utc|local}"
+                       exit 1 ;;
     esac
 }
 
@@ -48,12 +50,9 @@ main() {
 do_start() {
     [ ${#CMD_CLOCK} -gt 0 ] || return
 
-    . /live/lib/live-init-utils.sh
-
-    start_init_logging
-    load_translation
-
    echo_script "Configuring Hardware Clock" $0
+
+   check_rtc || exit 2
 
    mountpoint -q /live/aufs || PRETEND_MODE=true
    [ "$PRETEND_MODE" ] && echo_live "${YELLOW}Pretend mode enabled"
@@ -61,7 +60,7 @@ do_start() {
     case $CMD_CLOCK in
         local|utc) set_hwclock $CMD_CLOCK ;;
               ask) ask_hwclock            ;;
-                *)  error "Unknown %s option: %s" hwclock $(pquote $CMD_CLOCK) ;;
+                *)  error "Unknown %s option: %s" hwclock $(wq $CMD_CLOCK) ;;
     esac
 }
 
@@ -74,11 +73,32 @@ set_hwclock() {
     #grep -i -q $new $file && return
 
     case $new in
-        local) pretend sed -i 's/^UTC\s*$/LOCAL/' $file
-               pretend hwclock --hctosys --localtime      ;;
-          utc) pretend sed -i 's/^LOCAL\s*$/UTC/' $file
-               pretend hwclock --hctosys --utc            ;;
+        local) set_adjtime LOCAL
+               pretend hwclock --hctosys     ;;
+          utc) set_adjtime UTC
+               pretend hwclock --hctosys     ;;
     esac
+}
+
+set_adjtime() {
+    local file=/etc/adjtime type=$1
+    if test -e $file; then
+        pretend sed -i "3 s/.*/$type/" $file
+    else
+        if [ "$PRETEND_MODE" ]; then
+       cat<<Adjtime
+0.0 0 0.0
+0
+$type
+Adjtime
+        else
+       cat<<Adjtime > $file
+0.0 0 0.0
+0
+$type
+Adjtime
+        fi
+    fi
 }
 
 ask_hwclock() {
@@ -96,6 +116,7 @@ check_timezone() {
     read orig_tz 2>/dev/null <$TZ_FILE
     : ${TZ:=$orig_tz}
     [ ${#TZ} -eq 0 ] && fatal "No timezone found in file %s" $(pquote $TZ_FILE)
+    export TZ
 
     while true ; do
         yes_no_quit "$LIVE_COLOR$(printf "Is %s your current timezone" "$(pquote $TZ)")"
@@ -103,18 +124,30 @@ check_timezone() {
         case $ret in
              0) if [ "$orig_tz" != "$TZ" ]; then
                     export TZ
-                    pretend write_to_file $TZ_FILE $TZ
-                    # For localizing repos in live-init
-                    pretend append_file /live/config/cmdline "tz=$TZ"
+                    set_timezone $TZ
                 fi
-                return 0     ;;
-             1) set_timezone ;;
-             2) return 1     ;;
+                return 0        ;;
+             1) select_timezone ;;
+             2) return 1        ;;
         esac
     done
 }
 
 set_timezone() {
+    local tz=$1
+    local zone_file=$(readlink -f /usr/share/zoneinfo/$tz)
+    if test -f $zone_file; then
+        echo_live "Setting timezone and localtime to %s" "$(pquote $tz)"
+        pretend write_to_file $TZ_FILE $tz
+        pretend cp -f $(readlink -f $zone_file) /etc/localtime
+        # For localizing repos in live-init
+        pretend append_file /live/config/cmdline "tz=$tz"
+    else
+        error "Unknown time zone %s" "$(wq $tz)"
+    fi
+}
+
+select_timezone() {
     local DISTRO distro_file=/live/config/distro
     test -r distro_file && read DISTRO 2>/dev/null $distro_file
     : ${DISTRO:=MX}
@@ -160,11 +193,15 @@ check_hwclock() {
         yes_no_quit "Would you like to set the hardware clock manually to UTC or localtime" \
             && manual_set_hwclock
 
+        exit 0
+
     elif [ $diff_utc_loc -lt $MARGIN ]; then
         echo_live "Your local timezone and the UTC timezone are currently close but not the same"
         echo_live "They both say the current time is within 15 minutes of %s" "$(pquote $loc_str)"
         yes_no_quit "Would you like to set the hardware clock manually to UTC or localtime" \
             && manual_set_hwclock
+
+        exit 0
     else
         guess_hwclock "$utc_str" "$loc_str"
     fi
@@ -183,11 +220,11 @@ guess_hwclock() {
 Select_Data
 )
 
-    local select_menu=$(cat <<Select_Menu
-  1:   UTC: $(bold $utc_str) is within 10 minutes of the correct time.
-  2: Local: $(bold $loc_str) is within 10 minutes of the correct time.
-  3: Neither are within 10 minutes of the correct time.
-  4: Both are within 10 minutes of the correct time.
+    local select_menu=$(cat <<Select_Menu | sed -r -e "s/( [0-9]+)(\))/$green\1$white\2$nc_co/"
+   1)   UTC: $(bold $utc_str) is within 10 minutes of the correct time.
+   2) Local: $(bold $loc_str) is within 10 minutes of the correct time.
+   3) Neither are within 10 minutes of the correct time.
+   4) Both are within 10 minutes of the correct time.
 Select_Menu
 )
 
@@ -260,8 +297,8 @@ yes_no_quit() {
                     2) return 1           ;;
                     3) ask_really_quit    ;;
         esac
-        if [ $ans -ne 3 ]; then
-            error "$(printf "%s $ERROR_PARAM_COLOR%s" "You must enter 0, 1, or 2." "Press <enter>")"
+        if [ "$ans" != 3 ]; then
+            error '%s %s%s' "You must enter 0, 1, or 2." "$ERROR_PARAM_COLOR" "Press <enter>"
             read ans
         fi
     done
@@ -289,7 +326,7 @@ my_select_menu() {
     [ -z "${menu##*$cheat*}" ] || return
 
     if [ ! -e $dfile -o  ! -e $mfile ]; then
-        error "Missing $dfile or $mfile"
+        error "Missing %s or %s" $dfile $mfile
         exit 2
     fi
 
@@ -369,13 +406,29 @@ pqe()    { echo "$bold_co$*$err_co"       ;}
 
 get_hwclock() { LANG=en_US.UTF-8 hwclock --show $* | sed 's/  .*//'; }
 
-show_time() { echo_live "%12s:$START_PARAM %s" "$1" "$2"; }
-show_unix() { echo_live "%15s Unix:$START_PARAM %10s" "$1" "$2" ; }
+show_time() { echo_live '%12s:%s %s" "$1' $START_PARAM "$2"; }
+show_unix() { echo_live '%15s Unix:%s %10s' "$1" $START_PARAM "$2" ; }
 
 debug() { [ ${#db_hwc} -gt 0 ] && echo "$*"; }
 
+
+check_rtc() {
+    find_rtc && return 0
+    modprobe rtc-cmos
+    find_rtc && return 0
+    error "The realtime clock is not enabled.  Can't check hardware clock"
+    return 2
+}
+
+find_rtc() {
+    for x in "" 0 1 2 3; do
+        test -e $(readlink -f /dev/rtc$x) && return 0
+    done
+    return 1
+}
 write_to_file() {
     local file=$1
+    shift
     local dir=$(dirname $file)
     mkdir -p $dir
     echo -e "$*" > $file
@@ -383,6 +436,7 @@ write_to_file() {
 
 append_file() {
     local file=$1
+    shift
     local dir=$(dirname $file)
     mkdir -p $dir
     echo -e "$*" >> $file
@@ -395,6 +449,12 @@ pretend() {
         "$@"
     fi
 }
+
+fatal() {
+    error "$@"
+    exit 2
+}
+
 #-------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------
 main "$@" 2>&1 | tee -a $INIT_LOG_FILE
