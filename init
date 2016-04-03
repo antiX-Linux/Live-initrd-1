@@ -25,8 +25,8 @@
 # that you don't want users to be able to adjust.
 
                      ME="initrd init"
-                VERSION="7.52.02"
-           VERSION_DATE="Thu Mar 31 23:02:50 MDT 2016"
+                VERSION="7.52.03"
+           VERSION_DATE="Sat Apr  2 23:51:06 MDT 2016"
               DEVELOPER="BitJam"
          BUG_REPORT_URL="liveboot@mxlinux.org"
 
@@ -461,6 +461,9 @@ main_core() {
         local delta=$(get_seconds $((plus_t2 - plus_t1)))
         msg "$green@${cyan} Extras took$hi_co $delta${cyan} seconds"
     fi
+
+    rm -f $NEW_ROOT/etc/motd
+    test -e /issue && cp /issue $NEW_ROOT/etc/issue
 
     # FIXME: do this after copy_xtra for easy testing (for now) (????)
     PROC_CMDLINE=$(cat /live/config/proc-cmdline)
@@ -1044,13 +1047,19 @@ do_welcome() {
 
     vmsg 2 "Welcome to %s" "$(pq $pretty_name$arch)!"
 
-    if lspci -n | grep -q " 80ee:beef"; then
-        msg 'VirtualBox detected'
+    (   imsg "Welcome to %s! Powered by %s" "$(gq $pretty_name$arch)" "$(gq Debian)."
+        imsg "For cli install, login as %s (password is %s) and type %s" \
+            "$(gq root)" "$(gq root)"  "$(gq cli-installer)."
+        imsg "Follow the instructions."
+    ) > /issue
+
+    if lspci -n | grep -iq " 80ee:beef"; then
+        vmsg 7 'VirtualBox detected'
         touch /live/config/virtualbox
     fi
 
     local bat_stat=$(battery-status | sed "s/:/:$hi_co/" )
-    [ "$bat_stat" ] && msg %s "$bat_stat"
+    [ -n "$DB_PLUS" -a -n "$bat_stat" ] && msg %s "$bat_stat"
 
     # Get total ramsize, and available real ram in MB. We need this later.
 
@@ -1101,7 +1110,6 @@ show_bootcodes() {
         vmsg 4 "$hi_co    $code"
     done
     vmsg 4
-
 }
 
 show_integer_errors() {
@@ -2385,6 +2393,15 @@ pqe()    { echo "$bold_co$*$err_co"       ;}
 pqw()    { echo "$hi_co$*$warn_co"        ;}
 pqh()    { echo "$m_co$*$hi_co"           ;}
 hq()     { echo "$hi_co$*$m_co"           ;}
+ncq()    { echo "$hi_co$*$nc_co"          ;}
+gq()     { echo "$hi_co$*$lt_green"       ;}
+
+
+imsg() {
+    local fmt=$1
+    shift
+    printf "$lt_green$fmt$nc_co\n" "$@"
+}
 
 vmsg() {
     local level=$1  fmt=$2
@@ -2740,7 +2757,7 @@ my_select_menu() {
     unset MENU_VALUE
     [ "$menu" ] || return
 
-    local title=$1 blurb=$2 cheat=$3  name=$4 dfile=$dir/$4.data mfile=$dir/$4.menu fields=$5
+    local title=$1  blurb=$2  cheat=$3  dfile=$dir/$4.data mfile=$dir/$4.menu  label=$5  fields=$6
 
     [ -z "${menu##*$cheat*}" ] || return
 
@@ -2782,7 +2799,7 @@ my_select_menu() {
 
     case $MENU_VALUE in
         default|none|reset)                            ;;
-                   *) [ -n "$new_label" ] && msg "%s set to %s" "$name" "$(bq $new_label)"
+                   *) [ -n "$new_label" ] && msg "%s set to %s" "$label" "$(bq $new_label)"
                       cmdline="$cmdline $MENU_VALUE"   ;;
     esac
 }
@@ -2850,7 +2867,7 @@ do_early_menus() {
     local MENU_VALUE BOOT_MENU_WARN=true
     local lang time_zone option persist desktop
     local cmdline
-    my_select_menu 'Select Language'           'Languages are listed alphabetically'   l Language "lang=*"
+    my_select_menu "Select Language"           "Languages are listed alphabetically"   l lang "Language" "lang=*"
 
     case $MENU_VALUE in
         lang=*) LANG=${MENU_VALUE#lang=}
@@ -2858,9 +2875,9 @@ do_early_menus() {
          reset) read_xlat                  ;;
     esac
 
-    my_select_menu "Select Timezone"           "Timezones are listed by longitude"     t Timezone "tz=*"
-    my_select_menu "Select Option"             "Only one option can be selected"       o Options  "$OPTIONS_ENTRIES"
-    my_select_menu "Select Persistence Option" ""                                      p Persist  "persist-*|frugal-*"
+    my_select_menu "Select Timezone"           "Timezones are listed by longitude"     t tz      "Timezone"    "tz=*"
+    my_select_menu "Select Option"             "Only one option can be selected"       o options "Options"     "$OPTIONS_ENTRIES"
+    my_select_menu "Select Persistence Option" ""                                      p persist "Persistence" "persist-*|frugal-*"
     #vmsg 6 "cmdline:$white $cmdline"
     [ ${#cmdline} -gt 0 ] && echo "$cmdline" >> /live/config/cmdline
 }
@@ -2870,11 +2887,11 @@ do_late_menus() {
     local BOOT_MENU_WARN=
     local lang time_zone option persist desktop
     local cmdline
-    my_select_menu "Select Desktop" "" d Desktop "desktop=*|desktheme=*"
+    my_select_menu "Select Desktop" "" d desktop "Desktop" "desktop=*|desktheme=*"
 
     if [ "$REMASTERABLE" ]; then
         BOOT_MENU_DIR=/live/custom/$DISTRO_NAME/menus
-        my_select_menu "Save these changes?" "" s Save
+        my_select_menu "Save these changes?" "" s save "Save"
         echo "$cmdline" | grep -q bootsave && BOOT_SAVE=true
     fi
 
