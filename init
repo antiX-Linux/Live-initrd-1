@@ -2893,7 +2893,7 @@ my_select_menu() {
         return
     fi
 
-    local default_str=$(rpad "Default" 16)
+    local default_str=$(rpad 16 "Default")
     local menu=$(cat $mfile | sed -r \
         -e "s/Default( {8}| *$)/$default_str/" \
         -e "s/( [0-9]+)(\))/$green\1$white\2$cyan/g" \
@@ -2929,13 +2929,9 @@ my_select_menu() {
 }
 
 rpad() {
-    local str=$1 width=$2
-    local len=$(echo $str | wc -m)
-    local pad=$((width - len))
-    if [ $pad -le 0 ]; then
-        echo -n "$str"
-        return
-    fi
+    local width=$1  str=$2
+    local pad=$((width - $(echo $str | wc -m)))
+    [ $pad -le 0 ] && pad=0
     printf "%s%${pad}s" "$str" ""
 }
 
@@ -4040,8 +4036,8 @@ _persist_makefs() {
 
     # Make sure we don't exceed max size of 4G - 1 on vfat file systems
     mkdir -p $dir
-    local par_fstype=$(mntpnt_fstype $dir) mkfs_sizes=$MKFS_SIZES vfat
-    case $par_fstype in
+    local part_fstype=$(mntpnt_fstype $dir) mkfs_sizes=$MKFS_SIZES vfat
+    case $part_fstype in
         vfat) vfat=true ;;
            *) mkfs_sizes="$mkfs_sizes $BIGGER_SIZES" ;;
     esac
@@ -4088,7 +4084,7 @@ _persist_makefs() {
     heading "create %s persistence file" "$(fq $file)"
     vmsg 1 "Default size: %s Meg.  Filesystem type: %s" $(nq $default_size) $(pq ext4)
     vmsg 1 "This default size will leave %s Meg free" $(nq $((avail - default_size)))
-    [ "$vfat" ] &&  warn "Warning: this can take several minutes per Gig on a %s file system" $(pqw $par_fstype)
+    [ "$vfat" ] &&  warn "Warning: this can take several minutes per Gig on a %s file system" $(pqw $part_fstype)
 
     if [ "$AUTO_MAKE_FS" ]; then
         auto_mode=true
@@ -4129,8 +4125,8 @@ _persist_makefs() {
 
     breakpoint m "before makefs"
 
-    [ "$vfat" ] &&  warn "Warning: this can take several minutes per Gig on a %s file system" $(pqw $par_fstype)
-    if ! time_cmd makefs $full_file $fs_type $fs_size $par_fstype; then
+    [ "$vfat" ] &&  warn "Warning: this can take several minutes per Gig on a %s file system" $(pqw $part_fstype)
+    if ! time_cmd makefs $full_file $fs_type $fs_size $part_fstype; then
         err "Failed to create filesystem.  Deleting %s file" $(pqe $file)
         rm -f $full_file
         return 3
@@ -4145,17 +4141,17 @@ _persist_makefs() {
 }
 
 makefs() {
-    local file=$1  fstype=$2  size=$3  par_fstype=$4  dir=$(dirname $file)
+    local file=$1  fstype=$2  size=$3  part_fstype=$4  dir=$(dirname $file)
     mkdir -p $dir                                                             || return 1
     local fallocate=$(ld_path_which fallocate)
-    [ "$fallocate" ] || par_fstype=other
+    [ "$fallocate" ] || part_fstype=other
 
-    case $par_fstype in
+    case $part_fstype in
         ext4|btrfs) ld_path $fallocate --length ${size}M $file        1>> $MY_LOG 2>>$MY_LOG || return 2  ;;
-                 *) dd if=/dev/zero of=$file bs=1M count=0 seek=$size 1>> $MY_LOG 2>> $MY_LOG || return 2 ;;
+                 *) dd if=/dev/zero of=$file bs=1M count=0 seek=$size 1>> $MY_LOG 2>>$MY_LOG || return 2 ;;
     esac
     sync
-    ld_path /sbin/mkfs.$type -q -F $file              1>> $MY_LOG 2>> $MY_LOG || return 3
+    ld_path /sbin/mkfs.$type -q -F $file 1>> $MY_LOG 2>> $MY_LOG || return 3
 }
 
 default_makefs_size() {
